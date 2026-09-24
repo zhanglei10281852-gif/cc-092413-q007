@@ -48,3 +48,57 @@ class TaskComplete(BaseModel):
     worker_id: str = Field(..., min_length=1, max_length=80)
     result: dict = Field(default_factory=dict)
 
+
+class ChannelUpsert(BaseModel):
+    station_code: str = Field(..., min_length=2, max_length=32)
+    channel: str = Field(..., min_length=2, max_length=16)
+    sample_interval_seconds: int = Field(..., ge=1, le=86400)
+    brief_dropout_seconds: int = Field(..., ge=0, le=86400)
+
+    @field_validator("station_code", "channel")
+    @classmethod
+    def strip_codes(cls, value: str) -> str:
+        return value.strip().upper()
+
+
+class HeartbeatBatch(BaseModel):
+    observed_at: list[str] = Field(..., min_length=1, max_length=10000)
+
+
+class MaintenanceWindowCreate(BaseModel):
+    station_code: str = Field(..., min_length=2, max_length=32)
+    channel: str | None = Field(default=None, max_length=16)
+    start_at: str = Field(..., min_length=20, max_length=40)
+    end_at: str = Field(..., min_length=20, max_length=40)
+    reason: str = Field(..., min_length=1, max_length=300)
+    compensation: str = Field(default="excluded", pattern="^(excluded|imputed)$")
+    uid: str | None = Field(default=None, max_length=64)
+    idempotency_key: str | None = Field(default=None, max_length=120)
+    created_by: str = Field(default="system", max_length=80)
+
+    @field_validator("station_code", "channel")
+    @classmethod
+    def strip_codes(cls, value: str | None) -> str | None:
+        return value.strip().upper() if value is not None else value
+
+
+class MaintenanceWindowRevise(BaseModel):
+    start_at: str | None = Field(default=None, min_length=20, max_length=40)
+    end_at: str | None = Field(default=None, min_length=20, max_length=40)
+    reason: str | None = Field(default=None, min_length=1, max_length=300)
+    compensation: str | None = Field(default=None, pattern="^(excluded|imputed)$")
+    channel: str | None = Field(default=None, max_length=16)
+    actor: str = Field(default="system", max_length=80)
+
+
+class MaintenanceWindowDecision(BaseModel):
+    version: int | None = Field(default=None, ge=1)
+    decision: str = Field(..., pattern="^(approved|rejected)$")
+    approver: str = Field(..., min_length=1, max_length=80)
+    comment: str = Field(default="", max_length=300)
+
+
+class MaintenanceWindowCancel(BaseModel):
+    actor: str = Field(default="system", max_length=80)
+    reason: str = Field(default="", max_length=300)
+

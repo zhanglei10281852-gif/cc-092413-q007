@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.database import get_connection, transaction
+from app.seismic.timeutil import parse_instant, utc_iso
 
 
 SCHEMA = """
@@ -68,6 +69,72 @@ CREATE TABLE IF NOT EXISTS seismic_event_audit (
     before_json TEXT NOT NULL DEFAULT '{}',
     after_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS seismic_station_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_code TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    sample_interval_seconds INTEGER NOT NULL CHECK(sample_interval_seconds > 0 AND sample_interval_seconds <= 86400),
+    brief_dropout_seconds INTEGER NOT NULL CHECK(brief_dropout_seconds >= 0),
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(station_code, channel)
+);
+CREATE TABLE IF NOT EXISTS seismic_maintenance_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    station_code TEXT NOT NULL,
+    channel TEXT,
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    compensation TEXT NOT NULL CHECK(compensation IN ('excluded','imputed')),
+    status TEXT NOT NULL CHECK(status IN ('proposed','approved','rejected','cancelled','superseded')),
+    parent_version INTEGER NOT NULL DEFAULT 0,
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    effective_at TEXT NOT NULL,
+    superseded_at TEXT,
+    UNIQUE(uid, version)
+);
+CREATE INDEX IF NOT EXISTS idx_seismic_maint_window ON seismic_maintenance_windows(station_code, channel, start_at, end_at);
+CREATE TABLE IF NOT EXISTS seismic_maintenance_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('approved','rejected')),
+    approver TEXT NOT NULL,
+    comment TEXT NOT NULL DEFAULT '',
+    decided_at TEXT NOT NULL,
+    UNIQUE(uid, version)
+);
+CREATE TABLE IF NOT EXISTS seismic_channel_heartbeats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_code TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    source_offset TEXT NOT NULL DEFAULT '+00:00',
+    source_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(station_code, channel, observed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_seismic_heartbeat ON seismic_channel_heartbeats(station_code, channel, observed_at);
+CREATE TABLE IF NOT EXISTS seismic_uptime_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    station_code TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    report_date TEXT NOT NULL,
+    utc_offset TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    window_versions_json TEXT NOT NULL DEFAULT '[]',
+    observations_digest TEXT NOT NULL,
+    availability_rate REAL NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(station_code, channel, report_date, utc_offset, as_of)
 );
 CREATE INDEX IF NOT EXISTS idx_seismic_obs_event ON seismic_observations(event_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_seismic_tasks_status ON seismic_computations(status, created_at);
@@ -131,10 +198,11 @@ class SeismicService:
 
     def create_event(self, payload: dict[str, Any], actor: str = "system") -> dict[str, Any]:
         now = _now()
+        origin_time = utc_iso(parse_instant(payload["origin_time"], "发震时间"))
         with transaction(immediate=True) as connection:
             cursor = connection.execute(
                 "INSERT INTO seismic_events(external_id,origin_time,latitude,longitude,depth_km,magnitude,magnitude_type,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (payload["external_id"], payload["origin_time"], payload["latitude"], payload["longitude"], payload["depth_km"], payload["magnitude"], payload["magnitude_type"], payload["source"], now, now),
+                (payload["external_id"], origin_time, payload["latitude"], payload["longitude"], payload["depth_km"], payload["magnitude"], payload["magnitude_type"], payload["source"], now, now),
             )
             event_id = cursor.lastrowid
             connection.execute("INSERT INTO seismic_event_audit(event_id,action,actor,after_json,created_at) VALUES(?,?,?,?,?)", (event_id, "create", actor, json.dumps(payload, ensure_ascii=False), now))
@@ -172,15 +240,16 @@ class SeismicService:
             raise KeyError("event_not_found")
         quality_score, quality_status, quality_reason = _quality(payload)
         now = _now()
+        observed_at = utc_iso(parse_instant(payload["observed_at"], "观测时间"))
         source_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         with transaction(immediate=True) as connection:
             try:
                 cursor = connection.execute(
                     "INSERT INTO seismic_observations(event_id,station_code,channel,observed_at,pga,pgv,distance_km,quality_score,quality_status,quality_reason,source_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (event_id, payload["station_code"], payload["channel"], payload["observed_at"], payload.get("pga"), payload.get("pgv"), payload["distance_km"], quality_score, quality_status, quality_reason, source_hash, now),
+                    (event_id, payload["station_code"], payload["channel"], observed_at, payload.get("pga"), payload.get("pgv"), payload["distance_km"], quality_score, quality_status, quality_reason, source_hash, now),
                 )
             except sqlite3.IntegrityError:
-                existing = connection.execute("SELECT * FROM seismic_observations WHERE event_id=? AND station_code=? AND channel=? AND observed_at=?", (event_id, payload["station_code"], payload["channel"], payload["observed_at"])).fetchone()
+                existing = connection.execute("SELECT * FROM seismic_observations WHERE event_id=? AND station_code=? AND channel=? AND observed_at=?", (event_id, payload["station_code"], payload["channel"], observed_at)).fetchone()
                 return dict(existing) if existing else {}
             return dict(connection.execute("SELECT * FROM seismic_observations WHERE id=?", (cursor.lastrowid,)).fetchone())
 
