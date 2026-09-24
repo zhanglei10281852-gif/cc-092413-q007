@@ -6,6 +6,7 @@
 
 - 震情档案：登记地震事件、震源参数和台站观测，保留计算输入摘要。
 - 科学计算：提供震级、距离和烈度的确定性计算，以及可恢复后台任务。
+- 台站运行率：接收带时区偏移的心跳观测，按本地日历日识别连续缺测区间，区分短暂断链与长时间离线，结合经审批的维护窗口做排除/补偿，并支持窗口版本化后的历史报表重算。
 - 灾情协同：管理灾情报告、公告、部门责任和跨部门办理状态。
 - 身份与权限：用户、角色、细粒度权限、会话令牌、账号停用和会话撤销。
 - 审计记录：关键身份操作留痕，并对口令和令牌等敏感字段做过滤。
@@ -84,7 +85,7 @@ app/
   core/            时钟、安全、异常和分页能力
   repositories/    SQLite 查询与持久化读取
   routers/         灾情、事件、公告、部门和信访业务接口
-  seismic/         地震事件、台站观测和科学计算服务
+  seismic/         地震事件、台站观测、科学计算、台站运行率与维护窗口服务
   schemas/         管理接口输入模型
   services/        身份、审计和后台任务领域服务
   cli.py           初始化、检查和冒烟入口
@@ -92,6 +93,61 @@ app/
 tests/             核心、管理接口和原有业务回归测试
 tools/             本地维护脚本
 ```
+
+## 台站运行率与维护窗口
+
+面向监测中心每日报表：短暂断链、跨午夜维护窗口和真正的长时间离线必须分开，
+避免缺测率错误触发巡检。
+
+### 时间约定
+
+- 观测时刻必须携带显式时区偏移，如 `2026-09-24T20:00:00+08:00`。
+- 存储统一为 UTC（ISO 8601，`+00:00`），上报偏移单独保存在 `utc_offset_minutes` /
+  `start_offset_minutes`，响应以 `*_utc` 字段给 UTC 时间，并以 `offset`、
+  `submitted_offset` 明确偏移量。
+- 日报表以台站本地“某日”加偏移换算为 UTC 半开区间 `[day_start, day_end)`，
+  跨午夜窗口按边界确定性切分。
+
+### 上报观测（心跳）
+
+```bash
+curl -sS -X POST http://127.0.0.1:8432/api/seismic/uptime/samples \
+  -H 'Content-Type: application/json' \
+  -d '{"station_code":"SC01","channel":"HNZ","period_seconds":60,
+       "samples":[{"observed_at":"2026-09-24T20:00:00+08:00"},
+                  {"observed_at":"2026-09-24T20:01:00+08:00"}]}'
+```
+
+重复上报按 `(台站, 通道, UTC 时刻)` 幂等去重；同一时刻用不同偏移（如
+`08:00+08:00` 与 `00:00+00:00`）视为同一条。
+
+### 维护窗口
+
+- 窗口作用域为台站级（`channel="*"`）或通道级；同作用域时间重叠返回
+  `409 conflict`，首尾相接（半开区间 `[start,end)`）允许。台站级与通道级可并存，
+  归因时通道级优先。
+- 窗口状态为 `draft → approved → cancelled`；补偿标记（`excluded` 从分母剔除、
+  `backfill` 回填、`interpolated` 插值）只允许挂在已审批窗口上。
+- 创建支持 `client_token` 幂等键；修改、审批、取消都只追加版本快照，不删除历史。
+
+### 查询某日报表
+
+```bash
+curl -sS "http://127.0.0.1:8432/api/seismic/uptime/stations/SC01/channels/HNZ/daily-report?date=2026-09-24&offset_minutes=480"
+```
+
+响应给出：
+
+- `availability_rate`：有效率 = (实测 + 补偿) / (86400 − 排除时长)；
+- `gaps`：逐段连续缺测区间，含 `status`（`missing`/`compensated`/`excluded`）、
+  `reason_code`（不足 5 分钟为 `brief_disconnect`，否则 `extended_outage`，
+  窗口内为窗口原因）和 `compensation_source`（窗口、版本、工单、审批人）；
+- `reason_summary`：按状态与原因汇总的段数与秒数；
+- `window_versions`：本次计算实际采用的窗口版本集合。
+
+加 `as_of`（带偏移 ISO 时间）可按该时刻已落版的窗口版本重算历史报表，
+原始观测永不改写；同一 `as_of` 重算返回同一不可变运行记录
+（`GET /api/seismic/uptime/report-runs/{id}` 可复核）。
 
 ## 数据一致性
 

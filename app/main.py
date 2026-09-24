@@ -11,6 +11,8 @@ from app.database import close_connection, init_db
 from app.routers import affairs, announcements, departments, petitions, residents
 from app.seismic.router import router as seismic_router
 from app.seismic.service import ensure_schema as ensure_seismic_schema
+from app.seismic.uptime_router import router as uptime_router
+from app.seismic.uptime import ensure_schema as ensure_uptime_schema
 
 
 @asynccontextmanager
@@ -18,6 +20,7 @@ async def lifespan(app: FastAPI):
     del app
     init_db()
     ensure_seismic_schema()
+    ensure_uptime_schema()
     yield
     close_connection()
 
@@ -49,6 +52,7 @@ app.include_router(announcements.router)
 app.include_router(departments.router)
 app.include_router(petitions.router)
 app.include_router(seismic_router)
+app.include_router(uptime_router)
 
 
 @app.get("/")
